@@ -5,5 +5,4 @@ struct Candidate: Identifiable, Equatable {
     var name: String
     var color: Color
     var weight: Double = 1.0
-    var aiReason: String?
 }

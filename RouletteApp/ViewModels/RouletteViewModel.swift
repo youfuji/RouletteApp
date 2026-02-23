@@ -6,15 +6,30 @@ class RouletteViewModel: ObservableObject {
     @Published var candidates: [Candidate] = []
     @Published var opinions: [Opinion] = []
     @Published var inputText: String = ""
+    @Published var opinionText: String = ""
+    @Published var opinionAuthor: String = ""
     @Published var rotationAngle: Double = 0
     @Published var selectedResult: String = "スタートボタンを押してね"
     @Published var isSpinning: Bool = false
     @Published var isAnalyzing: Bool = false
+    @Published var aiReasons: [String] = []
+    @Published var errorMessage: String?
+    @Published var showSettings: Bool = false
     
-    private let aiService: AIServiceProtocol
+    let apiKeyManager: APIKeyManager
+    let rateLimiter: RateLimiter
     
-    init(aiService: AIServiceProtocol = MockAIService()) {
-        self.aiService = aiService
+    private var aiService: AIServiceProtocol {
+        if apiKeyManager.hasAPIKey {
+            return GeminiAIService(apiKey: apiKeyManager.apiKey)
+        } else {
+            return MockAIService()
+        }
+    }
+    
+    init(apiKeyManager: APIKeyManager? = nil, rateLimiter: RateLimiter? = nil) {
+        self.apiKeyManager = apiKeyManager ?? APIKeyManager()
+        self.rateLimiter = rateLimiter ?? RateLimiter()
         
         // Initial data
         addCandidate(name: "ラーメン")
@@ -39,10 +54,33 @@ class RouletteViewModel: ObservableObject {
         candidates.remove(atOffsets: offsets)
     }
     
+    // MARK: - Opinion Management
+    func addOpinion() {
+        let trimmedText = opinionText.trimmingCharacters(in: .whitespaces)
+        let trimmedAuthor = opinionAuthor.trimmingCharacters(in: .whitespaces)
+        guard !trimmedText.isEmpty else { return }
+        
+        let author = trimmedAuthor.isEmpty ? "匿名" : trimmedAuthor
+        opinions.append(Opinion(text: trimmedText, author: author))
+        opinionText = ""
+    }
+    
+    func removeOpinion(at offsets: IndexSet) {
+        opinions.remove(atOffsets: offsets)
+    }
+    
     // MARK: - AI Analysis
     func analyzeOpinions() async {
         guard !candidates.isEmpty else { return }
+        
+        // Check rate limit
+        guard rateLimiter.canMakeRequest else {
+            errorMessage = "本日のAI分析回数が上限（\(rateLimiter.dailyLimit)回）に達しました。\n翌日にリセットされます。"
+            return
+        }
+        
         isAnalyzing = true
+        errorMessage = nil
         
         do {
             let candidateNames = candidates.map { $0.name }
@@ -50,15 +88,23 @@ class RouletteViewModel: ObservableObject {
             
             let result = try await aiService.analyze(candidates: candidateNames, opinions: opinionTexts)
             
+            // Record usage
+            rateLimiter.recordUsage()
+            
             // Apply weights
             for (name, weight) in result.weights {
                 if let index = candidates.firstIndex(where: { $0.name == name }) {
                     candidates[index].weight = weight
-                    candidates[index].aiReason = result.reason
                 }
             }
+            
+            // Store reasons
+            aiReasons = result.reasons
+            
+        } catch let error as AIServiceError {
+            errorMessage = error.errorDescription
         } catch {
-            print("AI Analysis Error: \(error)")
+            errorMessage = "予期せぬエラー: \(error.localizedDescription)"
         }
         
         isAnalyzing = false
@@ -85,33 +131,13 @@ class RouletteViewModel: ObservableObject {
     }
     
     private func calculateResult() {
-        // Normalize current rotation to 0-360
         let currentRotation = rotationAngle.truncatingRemainder(dividingBy: 360)
-        
-        // Calculate the angle at the pointer (top, 270 degrees in SwiftUI coordinate system if 0 is right)
-        // However, standard math: 0 is right, 90 is bottom, 180 is left, 270 is top.
-        // SwiftUI default: 0 is right.
-        // To find what's at the TOP (270 deg / -90 deg), we need to account for rotation.
-        // Let's stick to the previous logic which seemed to work, or improve it for weighted.
-        
-        // Weighted Logic:
-        // 1. Calculate total weight
         let totalWeight = candidates.reduce(0) { $0 + $1.weight }
         
-        // 2. Determine where the pointer lands in the "cumulative weight" distribution.
-        // The wheel rotates CLOCKWISE. The pointer is fixed at the TOP.
-        // Effectively, we are sampling a point on the wheel.
-        
-        // Let's simplify: The visual rotation is `rotationAngle`.
-        // The pointer is at -90 degrees (Top) relative to the circle's 0 (Right).
-        // The effective angle on the wheel that is touching the pointer is:
-        // (PointerAngle - RotationAngle) normalized.
-        
-        let pointerAngle = 270.0 // Top
+        let pointerAngle = 270.0
         let effectiveAngle = (pointerAngle - currentRotation).truncatingRemainder(dividingBy: 360)
         let normalizedAngle = effectiveAngle < 0 ? effectiveAngle + 360 : effectiveAngle
         
-        // 3. Find which candidate covers this angle
         var currentAngle = 0.0
         for candidate in candidates {
             let sliceAngle = 360.0 * (candidate.weight / totalWeight)
